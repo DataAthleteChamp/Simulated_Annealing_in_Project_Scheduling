@@ -132,7 +132,7 @@ def create_visualizations(df: pd.DataFrame):
             df[col] = df[col].fillna(0)
 
         # Create tabs with comprehensive metrics
-        tabs = st.tabs(['📊 Performance Comparison', '📈 Violations Analysis', '📋 Raw Data'])
+        tabs = st.tabs(['📊 Performance Comparison', '📈 Violations Analysis', '📋 Table Data'])
 
         with tabs[0]:
             # Performance Metrics Visualization

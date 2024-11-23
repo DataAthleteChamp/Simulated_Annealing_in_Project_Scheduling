@@ -1,7 +1,7 @@
 import numpy as np
 import json
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 import os
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -30,7 +30,6 @@ class FastGreedyScheduler:
         """Initialize tracking variables"""
         self.best_schedule = None
         self.best_cost = float('inf')
-        self.current_violations = {'deadline': 0, 'resource': 0}
         self.start_time = None
 
     def _create_output_directories(self):
@@ -38,168 +37,188 @@ class FastGreedyScheduler:
         try:
             self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.output_dir = os.path.abspath(f"greedy_results_{self.timestamp}")
-            self.viz_dir = os.path.abspath(os.path.join(self.output_dir, "visualizations"))
-
+            self.viz_dir = os.path.join(self.output_dir, "visualizations")
             os.makedirs(self.output_dir, exist_ok=True)
             os.makedirs(self.viz_dir, exist_ok=True)
         except Exception as e:
             raise RuntimeError(f"Error creating directories: {str(e)}")
 
+    def _create_error_result(self) -> Dict:
+        """Create result dictionary for error cases"""
+        return {
+            'performance_metrics': {
+                'makespan': float('inf'),
+                'best_cost': float('inf'),
+                'execution_time': float(time.time() - self.start_time),
+                'iterations': 0,
+                'violations': {'deadline': 0, 'resource': 0}
+            },
+            'schedule': []
+        }
+
     def optimize(self) -> Dict:
-        """Fast greedy optimization"""
+        """Greedy optimization with constraint checking"""
+        print("Starting Greedy optimization...")
         self.start_time = time.time()
 
         try:
             # Initialize tracking
             schedule = []
             task_timings = {}
-            current_time = 0
+            resource_usage = {r: [] for r in self.global_resources}  # List of tuples for each resource
 
-            # Create task priority list
-            task_priorities = []
-            for i in range(self.num_tasks):
-                task = self.tasks[i]
-                score = (
-                    len(task.get('dependencies', [])),  # Fewer dependencies better
-                    task['deadline'],  # Earlier deadline better
-                    -task['priority']  # Higher priority better
-                )
-                task_priorities.append((i, score))
+            # Get tasks with dependencies ordered
+            dependency_order = self._get_dependency_order()
 
-            # Sort tasks by priority
-            sorted_tasks = sorted(task_priorities, key=lambda x: x[1])
-
-            # Schedule tasks
-            resource_usage = {r: [] for r in self.global_resources.keys()}
-            for task_id, _ in sorted_tasks:
+            # Schedule each task
+            for task_id in dependency_order:
                 task = self.tasks[task_id]
 
-                # Find earliest feasible start time
-                start_time = self._find_start_time(task_id, task_timings, resource_usage)
-                end_time = start_time + task['processing_time']
+                # Find feasible start time
+                start_time = self._find_feasible_start_time(
+                    task_id,
+                    task,
+                    task_timings,
+                    resource_usage
+                )
 
-                # Update timings
-                task_timings[task_id] = {
-                    'start': start_time,
-                    'end': end_time
-                }
+                # If found feasible time, schedule task
+                if start_time is not None:
+                    end_time = start_time + task['processing_time']
 
-                # Update resource usage
-                self._update_resource_usage(resource_usage, start_time, end_time, task)
+                    # Record timing
+                    task_timings[task_id] = {
+                        'start': start_time,
+                        'end': end_time
+                    }
 
-                schedule.append(task_id)
-                current_time = start_time
+                    # Update resource usage
+                    self._update_resource_usage(
+                        resource_usage,
+                        start_time,
+                        end_time,
+                        task['resource_requirements']
+                    )
 
-            # Calculate final metrics
+                    schedule.append(task_id)
+
+            # Calculate metrics
             makespan = max(timing['end'] for timing in task_timings.values())
-            self.current_violations = self._count_violations(schedule, task_timings)
+            deadline_violations = self._count_deadline_violations(task_timings)
+            resource_violations = self._count_resource_violations(resource_usage)
 
-            # Create standardized results
             results = {
                 'performance_metrics': {
                     'makespan': float(makespan),
-                    'best_cost': float(makespan + sum(self.current_violations.values()) * 1000),
+                    'best_cost': float(makespan),
                     'execution_time': float(time.time() - self.start_time),
                     'iterations': 1,
-                    'violations': self.current_violations
-                },
-                'schedule': self._create_final_schedule(schedule, task_timings),
-                'algorithm_parameters': {
-                    'method': 'greedy',
-                    'priority_weights': {
-                        'dependencies': 1,
-                        'deadline': 1,
-                        'priority': 1
+                    'violations': {
+                        'deadline': deadline_violations,
+                        'resource': resource_violations
                     }
-                }
+                },
+                'schedule': self._create_final_schedule(schedule, task_timings)
             }
 
-            # Save results and generate visualizations
+            # Save results and create visualizations
             self._save_report(results)
-            self.create_visualizations(results)
+            self.create_visualizations(results, resource_usage)
 
             return results
 
         except Exception as e:
             print(f"Error during optimization: {str(e)}")
-            return {
-                'performance_metrics': {
-                    'makespan': float('inf'),
-                    'best_cost': float('inf'),
-                    'execution_time': float(time.time() - self.start_time),
-                    'iterations': 0,
-                    'violations': {'deadline': 0, 'resource': 0}
-                },
-                'schedule': [],
-                'error': str(e)
-            }
+            return self._create_error_result()
 
-    def _find_start_time(self, task_id: int, task_timings: Dict, resource_usage: Dict) -> int:
-        """Find earliest feasible start time for a task"""
-        task = self.tasks[task_id]
+    def _get_dependency_order(self) -> List[int]:
+        """Get tasks ordered by dependencies"""
+        # Build dependency graph
+        graph = {i: set(self.tasks[i].get('dependencies', []))
+                 for i in range(self.num_tasks)}
+
+        # Calculate deadlines considering dependencies
+        deadlines = {}
+        for i in range(self.num_tasks):
+            task = self.tasks[i]
+            deadline = task['deadline']
+            for dep in task.get('dependencies', []):
+                deadline = min(deadline, self.tasks[dep]['deadline'] - self.tasks[dep]['processing_time'])
+            deadlines[i] = deadline
+
+        # Sort by adjusted deadline
+        ordered = sorted(range(self.num_tasks), key=lambda x: deadlines[x])
+
+        return ordered
+
+    def _find_feasible_start_time(self, task_id: int, task: Dict,
+                                  task_timings: Dict, resource_usage: Dict) -> Optional[int]:
+        """Find earliest feasible start time that avoids violations"""
+        # Get earliest time from dependencies
         start_time = 0
-
-        # Consider dependencies
         for dep in task.get('dependencies', []):
             if dep in task_timings:
                 start_time = max(start_time, task_timings[dep]['end'])
 
-        # Find time when resources are available
-        while not self._check_resource_availability(start_time, task, resource_usage):
+        # Try times until deadline
+        deadline = task['deadline']
+        processing_time = task['processing_time']
+
+        while start_time + processing_time <= deadline:
+            # Check resource availability
+            if self._check_resource_availability(
+                    start_time,
+                    start_time + processing_time,
+                    task['resource_requirements'],
+                    resource_usage
+            ):
+                return start_time
+
             start_time += 1
 
-        return start_time
+        return None
 
-    def _check_resource_availability(self, start_time: int, task: Dict, resource_usage: Dict) -> bool:
-        """Check if resources are available at given time"""
-        end_time = start_time + task['processing_time']
+    def _check_resource_availability(self, start: int, end: int,
+                                     requirements: Dict, usage: Dict) -> bool:
+        """Check if resources are available in time period"""
+        for resource, amount in requirements.items():
+            # Get current usage timeline
+            timeline = usage[resource]
 
-        for resource, usage_list in resource_usage.items():
-            # Remove completed tasks
-            usage_list = [u for u in usage_list if u[1] > start_time]
-
-            # Check resource availability
-            for t in range(start_time, end_time):
-                current_usage = sum(amount for s, e, amount in usage_list if s <= t < e)
-                if current_usage + task['resource_requirements'].get(resource, 0) > self.global_resources[resource]:
+            # Check each time point
+            for t in range(start, end):
+                current_usage = sum(amt for s, e, amt in timeline
+                                    if s <= t < e)
+                if current_usage + amount > self.global_resources[resource]:
                     return False
 
         return True
 
-    def _update_resource_usage(self, resource_usage: Dict, start_time: int, end_time: int, task: Dict):
-        """Update resource usage tracking"""
-        for resource, amount in task['resource_requirements'].items():
-            if resource not in resource_usage:
-                resource_usage[resource] = []
-            resource_usage[resource].append((start_time, end_time, amount))
-            resource_usage[resource].sort()  # Keep sorted by start time
+    def _update_resource_usage(self, usage: Dict, start: int, end: int, requirements: Dict):
+        """Update resource usage with new task"""
+        for resource, amount in requirements.items():
+            usage[resource].append((start, end, amount))
 
-    def _count_violations(self, schedule: List[int], timings: Dict) -> Dict:
-        """Count deadline and resource violations"""
-        violations = {'deadline': 0, 'resource': 0}
+    def _count_deadline_violations(self, task_timings: Dict) -> int:
+        """Count number of deadline violations"""
+        violations = 0
+        for task_id, timing in task_timings.items():
+            if timing['end'] > self.tasks[task_id]['deadline']:
+                violations += 1
+        return violations
 
-        # Create resource usage timeline
-        makespan = max(timing['end'] for timing in timings.values())
-        resource_timeline = {t: {r: 0 for r in self.global_resources}
-                             for t in range(int(makespan) + 1)}
+    def _count_resource_violations(self, resource_usage: Dict) -> int:
+        """Count number of resource violations"""
+        violations = 0
+        for resource, timeline in resource_usage.items():
+            if not timeline:
+                continue
 
-        # Fill resource timeline
-        for task_id in schedule:
-            task = self.tasks[task_id]
-            timing = timings[task_id]
-
-            # Deadline violations
-            if timing['end'] > task['deadline']:
-                violations['deadline'] += 1
-
-            # Calculate resource usage
-            for t in range(int(timing['start']), int(timing['end'])):
-                for resource, amount in task['resource_requirements'].items():
-                    resource_timeline[t][resource] += amount
-                    # Check if usage exceeds capacity
-                    if resource_timeline[t][resource] > self.global_resources[resource]:
-                        violations['resource'] += 1
-
+            max_time = max(end for _, end, _ in timeline)
+            for t in range(max_time):
+                usage = sum(amt for start, end, amt in timeline if start <= t < end)
+                if usage > self.global_resources[resource]:
+                    violations += 1
         return violations
 
     def _create_final_schedule(self, schedule: List[int], timings: Dict) -> List[Dict]:
@@ -225,7 +244,7 @@ class FastGreedyScheduler:
         except Exception as e:
             print(f"Error saving report: {str(e)}")
 
-    def create_visualizations(self, results: Dict):
+    def create_visualizations(self, results: Dict, resource_usage: Dict):
         """Generate all visualizations"""
         try:
             schedule = results['schedule']
@@ -234,8 +253,8 @@ class FastGreedyScheduler:
                 return
 
             self._plot_schedule(schedule)
-            self._plot_resource_utilization(schedule)
-            print(f"Visualizations saved in: {self.viz_dir}")
+            self._plot_deadline_violations(schedule)
+            self._plot_resource_utilization(schedule, resource_usage)
 
         except Exception as e:
             print(f"Error creating visualizations: {str(e)}")
@@ -257,58 +276,70 @@ class FastGreedyScheduler:
                         linestyle='--',
                         alpha=0.3)
 
-        plt.title('Greedy Schedule')
+        plt.title('Greedy Schedule (with Deadlines)')
         plt.xlabel('Time')
         plt.ylabel('Task ID')
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.viz_dir, 'schedule.png'))
         plt.close()
 
-    def _plot_resource_utilization(self, schedule: List[Dict]):
-        """Plot resource utilization over time"""
-        makespan = max(task['end_time'] for task in schedule)
-        timeline = {t: {r: 0 for r in self.global_resources}
-                    for t in range(int(makespan) + 1)}
+    def _plot_deadline_violations(self, schedule: List[Dict]):
+        """Plot deadline violations analysis"""
+        plt.figure(figsize=(15, 6))
 
-        # Calculate resource usage
+        violations = []
         for task in schedule:
-            task_id = task['task_id']
-            start = int(task['start_time'])
-            end = int(task['end_time'])
+            violation = max(0, task['end_time'] - task['deadline'])
+            violations.append(violation)
 
-            for t in range(start, end):
-                for resource, amount in self.tasks[task_id]['resource_requirements'].items():
-                    timeline[t][resource] += amount
-
-        plt.figure(figsize=(15, 8))
-
-        for resource in self.global_resources:
-            usage = [timeline[t][resource] for t in range(int(makespan) + 1)]
-            plt.plot(usage, label=f'{resource} Usage', alpha=0.7)
-
-            # Add capacity line
-            plt.axhline(y=self.global_resources[resource],
-                        color='red',
-                        linestyle='--',
-                        alpha=0.3,
-                        label=f'{resource} Capacity')
-
-        plt.title('Resource Utilization Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Resource Usage')
-        plt.legend()
+        plt.bar(range(len(violations)), violations, alpha=0.6, color='salmon')
+        plt.title('Deadline Violations by Task')
+        plt.xlabel('Task ID')
+        plt.ylabel('Time Units Overdue')
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.viz_dir, 'resource_utilization.png'))
+        plt.savefig(os.path.join(self.viz_dir, 'deadline_violations.png'))
         plt.close()
+
+    def _plot_resource_utilization(self, schedule: List[Dict], resource_usage: Dict):
+        """Plot resource utilization over time"""
+        try:
+            makespan = max(task['end_time'] for task in schedule)
+            max_time = int(makespan) + 1
+
+            plt.figure(figsize=(15, 8))
+
+            # Plot each resource usage
+            for resource_name, timeline in resource_usage.items():
+                usage = [0] * max_time
+                for start, end, amount in timeline:
+                    for t in range(int(start), int(end)):
+                        if t < max_time:
+                            usage[t] += amount
+
+                plt.plot(usage, label=f'{resource_name} Usage', alpha=0.7)
+                plt.axhline(y=self.global_resources[resource_name],
+                            color='red',
+                            linestyle='--',
+                            alpha=0.3,
+                            label=f'{resource_name} Capacity')
+
+            plt.title('Resource Utilization Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Resource Usage')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(self.viz_dir, 'resource_utilization.png'))
+            plt.close()
+
+        except Exception as e:
+            print(f"Error plotting resource utilization: {str(e)}")
 
 
 def main():
     dataset_path = os.path.join('advanced_task_scheduling_datasets',
-                                'advanced_task_scheduling_small_dataset.json')
+                                'advanced_task_scheduling_large_dataset.json')
 
     scheduler = FastGreedyScheduler(dataset_path)
-    print("Starting Greedy optimization...")
-
     results = scheduler.optimize()
 
     print("\nResults:")
@@ -317,7 +348,6 @@ def main():
     print(f"Execution Time: {results['performance_metrics']['execution_time']:.2f} seconds")
     print(f"Deadline Violations: {results['performance_metrics']['violations']['deadline']}")
     print(f"Resource Violations: {results['performance_metrics']['violations']['resource']}")
-    print(f"\nResults and visualizations saved in: {scheduler.output_dir}")
 
 
 if __name__ == "__main__":
