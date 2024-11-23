@@ -366,29 +366,41 @@ class SimulatedAnnealingScheduler:
             print(f"Error estimating initial temperature: {str(e)}")
             return 1000.0
 
-
     def _create_output_directories(self):
-        """Create directories for output files"""
+        """Create directories for output files with Streamlit compatibility"""
         try:
             # Create timestamp
             self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # Create absolute paths
-            current_dir = os.getcwd()
-            self.output_dir = os.path.abspath(os.path.join(current_dir, f"sa_results_{self.timestamp}"))
-            self.viz_dir = os.path.abspath(os.path.join(self.output_dir, "visualizations"))
+            # Get project root directory (where the Streamlit app is running)
+            root_dir = os.path.abspath(os.getcwd())
 
-            # Create directories
-            os.makedirs(self.output_dir, exist_ok=True)
-            os.makedirs(self.viz_dir, exist_ok=True)
+            # Create absolute paths that work in both direct and Streamlit execution
+            self.output_dir = os.path.join(root_dir, f"sa_results_{self.timestamp}")
+            self.viz_dir = os.path.join(self.output_dir, "visualizations")
 
-            print(f"Created output directories:\n"
-                  f"Main: {self.output_dir}\n"
-                  f"Visualizations: {self.viz_dir}")
+            # Create directories with proper permissions
+            os.makedirs(self.output_dir, mode=0o777, exist_ok=True)
+            os.makedirs(self.viz_dir, mode=0o777, exist_ok=True)
+
+            print(f"\nOutput directories created:")
+            print(f"Results: {self.output_dir}")
+            print(f"Visualizations: {self.viz_dir}")
+
+            # Test write permissions by creating a test file
+            test_file = os.path.join(self.output_dir, 'test.txt')
+            try:
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+            except Exception as e:
+                print(f"Warning: Write permission test failed: {str(e)}")
+
+            return True
 
         except Exception as e:
             print(f"Error creating directories: {str(e)}")
-            raise
+            return False
 
     def _plot_convergence(self):
         """Plot optimization convergence history"""
@@ -580,33 +592,68 @@ class SimulatedAnnealingScheduler:
             return False  # Return False on failure
 
     def _save_report(self, result: Dict):
-        """Save optimization results to file"""
+        """Save optimization results with Streamlit compatibility"""
         try:
-            # Save JSON report
+            # Ensure directory exists and is writable
+            if not os.path.exists(self.output_dir):
+                os.makedirs(self.output_dir, mode=0o777, exist_ok=True)
+
+            # Convert all numpy and special types to Python native types
+            def convert_to_native(obj):
+                if isinstance(obj, (np.int_, np.int64)):
+                    return int(obj)
+                elif isinstance(obj, (np.float_, np.float64)):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {k: convert_to_native(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_to_native(i) for i in obj]
+                return obj
+
+            # Convert result to native Python types
+            result = convert_to_native(result)
+
+            # Save report with absolute path
             report_path = os.path.join(self.output_dir, 'analysis_report.json')
             with open(report_path, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
-            # Generate and save visualizations
-            self.create_visualizations()
+            # Verify file was created
+            if not os.path.exists(report_path):
+                print(f"Warning: Report file was not created at {report_path}")
+                return False
 
-            print(f"Results saved to: {self.output_dir}")
+            print(f"Report saved to: {report_path}")
+            return True
 
         except Exception as e:
-            print(f"Error saving results: {str(e)}")
+            print(f"Error saving report: {str(e)}")
+            return False
 
     def _save_plot(self, fig, filename: str) -> bool:
-        """Helper method to save plots with proper error handling"""
+        """Save plot with Streamlit compatibility"""
         try:
             # Ensure visualization directory exists
-            os.makedirs(self.viz_dir, exist_ok=True)
+            if not os.path.exists(self.viz_dir):
+                os.makedirs(self.viz_dir, mode=0o777, exist_ok=True)
 
             # Create full file path
             filepath = os.path.join(self.viz_dir, filename)
 
-            # Save the plot
-            fig.savefig(filepath, dpi=300, bbox_inches='tight')
+            # Save with high quality
+            fig.savefig(filepath,
+                        dpi=300,
+                        bbox_inches='tight',
+                        pad_inches=0.1,
+                        format='png')
             plt.close(fig)
+
+            # Verify file was created
+            if not os.path.exists(filepath):
+                print(f"Warning: Plot file was not created at {filepath}")
+                return False
 
             print(f"Saved plot: {filepath}")
             return True
@@ -653,66 +700,161 @@ class SimulatedAnnealingScheduler:
             print(f"Error during visualization generation: {str(e)}")
 
     def optimize(self) -> Dict:
-        """Run optimization with proper structure"""
+        """Run optimization with comprehensive result tracking and proper file handling"""
+        print("Starting optimization...")
+
         try:
             self.start_time = time.time()
+
+            # Initialize optimization
             current_schedule = self._create_initial_solution()
             current_cost, current_violations = self._calculate_cost(current_schedule)
 
             self.best_schedule = current_schedule.copy()
             self.best_cost = current_cost
-            self.current_violations = current_violations
+            self.current_violations = current_violations.copy()
 
+            # Initialize tracking
             temperature = self.initial_temp
             iteration = 0
+            no_improvement_counter = 0
+            last_improvement_cost = self.best_cost
+
+            # Clear history lists
+            self.cost_history = []
+            self.temperature_history = []
+
+            # Statistics tracking
+            accepted_moves = 0
+            rejected_moves = 0
+            improvement_moves = 0
 
             while temperature > self.min_temp and iteration < self.max_iterations:
+                # Generate and evaluate neighbor
                 neighbor_schedule = self._generate_neighbor(current_schedule)
                 neighbor_cost, neighbor_violations = self._calculate_cost(neighbor_schedule)
 
+                # Calculate acceptance probability
                 cost_diff = neighbor_cost - current_cost
-                if cost_diff < 0 or random.random() < np.exp(-cost_diff / temperature):
+                if cost_diff < 0:
+                    acceptance_probability = 1.0
+                    improvement_moves += 1
+                else:
+                    # Scale cost_diff to prevent overflow
+                    scaled_diff = min(500, cost_diff / (current_cost + 1))
+                    acceptance_probability = np.exp(-scaled_diff / temperature)
+
+                # Accept or reject neighbor
+                if random.random() < acceptance_probability:
                     current_schedule = neighbor_schedule
                     current_cost = neighbor_cost
                     current_violations = neighbor_violations
+                    accepted_moves += 1
 
+                    # Update best solution if improved
                     if current_cost < self.best_cost:
                         self.best_schedule = current_schedule.copy()
                         self.best_cost = current_cost
-                        self.current_violations = neighbor_violations
+                        self.current_violations = current_violations.copy()
+                        last_improvement_cost = current_cost
+                        no_improvement_counter = 0
+                else:
+                    rejected_moves += 1
 
+                # Track progress
+                self.cost_history.append(float(current_cost))
+                self.temperature_history.append(float(temperature))
+
+                # Check for stagnation
+                if current_cost >= last_improvement_cost:
+                    no_improvement_counter += 1
+                else:
+                    no_improvement_counter = 0
+                    last_improvement_cost = current_cost
+
+                # Apply perturbation if stuck
+                if no_improvement_counter >= 1000:
+                    current_schedule = self._perturb_solution(current_schedule)
+                    current_cost, current_violations = self._calculate_cost(current_schedule)
+                    no_improvement_counter = 0
+
+                # Update temperature
                 temperature *= self.alpha
                 iteration += 1
 
+                # Progress reporting
                 if iteration % 100 == 0:
                     print(f"Iteration {iteration}, Cost: {current_cost:.2f}, Temp: {temperature:.2f}")
 
-            # Calculate final schedule
+            # Calculate final schedule and metrics
             final_schedule = self._calculate_final_schedule()
             makespan = self._calculate_makespan(final_schedule)
             execution_time = time.time() - self.start_time
 
+            # Prepare comprehensive results
             result = {
                 'performance_metrics': {
                     'makespan': float(makespan),
                     'best_cost': float(self.best_cost),
                     'execution_time': float(execution_time),
                     'iterations': int(iteration),
-                    'violations': self.current_violations
+                    'final_temperature': float(temperature),
+                    'acceptance_rate': float(accepted_moves / max(1, accepted_moves + rejected_moves)),
+                    'improvement_rate': float(improvement_moves / max(1, iteration)),
+                    'violations': {
+                        'deadline': int(self.current_violations['deadline']),
+                        'resource': int(self.current_violations['resource'])
+                    }
                 },
-                'schedule': final_schedule,
-                'algorithm_params': {
+                'optimization_params': {
                     'initial_temperature': float(self.initial_temp),
                     'final_temperature': float(temperature),
-                    'cooling_rate': float(self.alpha)
+                    'cooling_rate': float(self.alpha),
+                    'max_iterations': int(self.max_iterations)
+                },
+                'schedule': final_schedule,
+                'convergence_history': {
+                    'costs': [float(c) for c in self.cost_history],
+                    'temperatures': [float(t) for t in self.temperature_history]
+                },
+                'algorithm_statistics': {
+                    'accepted_moves': int(accepted_moves),
+                    'rejected_moves': int(rejected_moves),
+                    'improvement_moves': int(improvement_moves)
                 }
             }
+
+            # Save results and create visualizations
+            try:
+                # Ensure output directories exist
+                if not os.path.exists(self.output_dir):
+                    os.makedirs(self.output_dir, mode=0o777, exist_ok=True)
+                if not os.path.exists(self.viz_dir):
+                    os.makedirs(self.viz_dir, mode=0o777, exist_ok=True)
+
+                # Save report
+                report_path = os.path.join(self.output_dir, 'analysis_report.json')
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+                print(f"Report saved to: {report_path}")
+
+                # Create visualizations
+                self.create_visualizations()
+
+                # Force sync to ensure files are written
+                if hasattr(os, 'sync'):
+                    os.sync()
+
+            except Exception as e:
+                print(f"Error saving results: {str(e)}")
 
             return result
 
         except Exception as e:
             print(f"Error during optimization: {str(e)}")
             execution_time = time.time() - self.start_time
+
+            # Return minimal valid result structure
             return {
                 'performance_metrics': {
                     'makespan': float('inf'),
